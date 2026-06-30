@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gin-contrib/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog"
 )
@@ -27,7 +28,7 @@ const DEFAULT_NAMESPACE = "default"
 const DEFAULT_PROXY_TIMEOUT = 180.0 // 3 mins
 const DEFAULT_CLUSTER_DOMAIN = "cluster.local"
 
-var log = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).
+var log = zerolog.New(os.Stdout).
 	With().
 	Timestamp().
 	Caller().
@@ -134,6 +135,7 @@ func proxyHandler(c *gin.Context) {
 			"error": "X-Pod-Namespace is required",
 		})
 	}
+
 	// Sanitize to prevent DNS injection.
 	if !isValidDnsLabel(namespace) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
@@ -164,8 +166,7 @@ func proxyHandler(c *gin.Context) {
 	}
 
 	var targetHost strings.Builder
-
-	// Final result will be: podname.namespace.svc.cluster.local
+	// Final result will be: podId.podNamespace.svc.cluster.local
 	var internalDNSName []string = []string{
 		podId,
 		namespace,
@@ -181,11 +182,8 @@ func proxyHandler(c *gin.Context) {
 		ip := net.ParseIP(podIP)
 		// IsLoopBack reports whether ip is a loopback address
 		// for instance: 127.0.0.1 (resolve to localhost, IPv4) or ::1 (IPv6)
-		//
 		// IsLinkLocalUnicast reports whether ip is a link-local unicast address
-		//
 		// IsMulticast report whether ip is a multicast address
-		//
 		// IsUnspecified reports unspecified address. IPv4 0.0.0.0 and IPv6 ::
 		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
@@ -248,46 +246,20 @@ func proxyHandler(c *gin.Context) {
 }
 
 func main() {
-	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).
-		With().
-		Timestamp().
-		Caller().
-		Logger()
-
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	r.Use(logger.SetLogger(
+		logger.WithLogger(func(c *gin.Context, l zerolog.Logger) zerolog.Logger {
+			return log
+		}),
+	))
 	r.Use(gin.Recovery())
-	r.Use(func(c *gin.Context) {
-		start := time.Now()
-		path := c.Request.URL.Path
-		raw := c.Request.URL.RawQuery
-		c.Next()
-		latency := time.Since(start)
-		status := c.Writer.Status()
-		logEvent := logger.Info().
-			Int("status", status).
-			Str("method", c.Request.Method).
-			Str("path", path).
-			Dur("latency", latency).
-			Str("ip", c.ClientIP())
-		if raw != "" {
-			logEvent.Str("query", raw)
-		}
-		if len(c.Errors) > 0 {
-			logEvent.Str("error", c.Errors.String())
-		}
-	})
-
 	r.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status": "OK",
 		})
 	})
-
 	// Catch all requests except routes with higher precedence.
 	r.NoRoute(proxyHandler)
-
-	logger.Info().Int("port", 8888).Msg("starting minrouter")
-
 	r.Run(":8888")
 }
