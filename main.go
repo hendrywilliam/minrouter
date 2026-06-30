@@ -26,7 +26,7 @@ import (
 // Proxy configuration
 const MIN_TCP_PORT = 1
 const MAX_TCP_PORT = 65535
-const DEFAULT_PROXY_TIMEOUT = 180.0 // 3 mins
+const DEFAULT_PROXY_TIMEOUT = 30
 const DEFAULT_PROXY_PORT = "8080"
 
 // Pod configuration
@@ -152,7 +152,7 @@ func proxyHandler(c *gin.Context) {
 	if strPort == "" {
 		strPort = DEFAULT_POD_PORT
 	}
-	port, err := strconv.Atoi(c.Request.Header.Get("X-Pod-Port"))
+	port, err := strconv.Atoi(strPort)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 			"error": "invalid X-Pod-Port format",
@@ -176,7 +176,7 @@ func proxyHandler(c *gin.Context) {
 	}
 
 	// Dynamic routing.
-	// Route by Pod ID if provided by client,
+	// Route by Pod IP if provided by client,
 	// otherwise fallback to DNS name and leveraging CoreDNS DNS resolution.
 	podIP := c.Request.Header.Get("X-Pod-IP")
 	if podIP != "" {
