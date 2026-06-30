@@ -1,0 +1,293 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"math"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/rs/zerolog"
+)
+
+const MIN_TCP_PORT = 1
+const MAX_TCP_PORT = 65535
+
+const DEFAULT_PORT = 8888
+const DEFAULT_NAMESPACE = "default"
+const DEFAULT_PROXY_TIMEOUT = 180.0 // 3 mins
+const DEFAULT_CLUSTER_DOMAIN = "cluster.local"
+
+var log = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).
+	With().
+	Timestamp().
+	Caller().
+	Logger()
+
+var clusterDomain = getClusterDomain()
+var dnsLabelRegex = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
+var proxyTimeout = getProxyTimeout()
+
+func getProxyTimeout() float64 {
+	raw := os.Getenv("PROXY_TIMEOUT_SECONDS")
+	if raw == "" {
+		log.Debug().Msg("PROXY_TIMEOUT_SECONDS not set, using default")
+		return DEFAULT_PROXY_TIMEOUT
+	}
+	num, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		log.Warn().Str("value", raw).Err(err).Msg("invalid PROXY_TIMEOUT_SECONDS, falling back to default")
+		return DEFAULT_PROXY_TIMEOUT
+	}
+	if num <= 0 {
+		log.Warn().Float64("value", num).Msg("PROXY_TIMEOUT_SECONDS must be positive, falling back to default")
+		return DEFAULT_PROXY_TIMEOUT
+	}
+	log.Info().Float64("timeout", num).Msg("proxy timeout configured")
+	return num
+}
+
+func getClusterDomain() string {
+	clusterDomain := os.Getenv("CLUSTER_DOMAIN")
+	if clusterDomain == "" {
+		log.Warn().Str("value", clusterDomain).Msg("WARNING: CLUSTER_DOMAIN must not be an empty string")
+		return DEFAULT_CLUSTER_DOMAIN
+	}
+	return clusterDomain
+}
+
+func getRequestTimeout(h *http.Request) float64 {
+	raw := h.Header.Get("X-Router-Timeout")
+	if raw == "" {
+		return proxyTimeout
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		log.Warn().Str("value", raw).Err(err).Msg("failed to parse X-Router-Timeout value, falling back to default")
+		return proxyTimeout
+	}
+	if math.IsInf(value, 0) || math.IsNaN(value) || value <= 0 {
+		log.Warn().Str("value", raw).Err(err).Msg("X-Router-Timeout must be finite and positive, falling back to default")
+		return proxyTimeout
+	}
+	if value > proxyTimeout {
+		log.Warn().Str("value", raw).Err(err).Msg("X-Router-Timeout exceeds configured, capping to default.")
+		return proxyTimeout
+	}
+	return value
+}
+
+func isValidDnsLabel(label string) bool {
+	if label == "" || len(label) > 63 {
+		return false
+	}
+	return dnsLabelRegex.Match([]byte(label))
+}
+
+func envVarIsTruthy(name string) bool {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return false
+	}
+	truthyValues := []string{"1", "true", "yes", "y"}
+	rawL := strings.ToLower(raw)
+	return slices.Contains(truthyValues, rawL)
+}
+
+func proxyHandler(c *gin.Context) {
+	allowedMethods := []string{"get", "post", "put", "delete", "patch"}
+	if !slices.Contains(allowedMethods, strings.ToLower(c.Request.Method)) {
+		c.AbortWithStatusJSON(http.StatusMethodNotAllowed, gin.H{
+			"error": "method is not allowed",
+		})
+		return
+	}
+
+	podId := c.Request.Header.Get("X-Pod-ID")
+	if podId == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "X-Pod-ID is required",
+		})
+		return
+	}
+
+	// Sanitize to prevent DNS injection.
+	if !isValidDnsLabel(podId) {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "invalid Pod id format",
+		})
+		return
+	}
+
+	namespace := c.Request.Header.Get("X-Pod-Namespace")
+	if namespace == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "X-Pod-Namespace is required",
+		})
+	}
+	// Sanitize to prevent DNS injection.
+	if !isValidDnsLabel(namespace) {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "invalid Pod namespace format",
+		})
+		return
+	}
+
+	strPort := c.Request.Header.Get("X-Pod-Port")
+	if strPort == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "X-Pod-Port is required",
+		})
+		return
+	}
+	port, err := strconv.Atoi(c.Request.Header.Get("X-Pod-Port"))
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "invalid X-Pod-Port format",
+		})
+		return
+	}
+	if !(MIN_TCP_PORT <= port && port <= MAX_TCP_PORT) {
+		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
+			"error": "invalid X-Pod-Port format",
+		})
+		return
+	}
+
+	var targetHost strings.Builder
+
+	// Final result will be: podname.namespace.svc.cluster.local
+	var internalDNSName []string = []string{
+		podId,
+		namespace,
+		"svc",
+		clusterDomain,
+	}
+
+	// Dynamic routing.
+	// Route by Pod ID if provided by client,
+	// otherwise fallback to DNS name and leveraging CoreDNS DNS resolution.
+	podIP := c.Request.Header.Get("X-Pod-IP")
+	if podIP != "" {
+		ip := net.ParseIP(podIP)
+		// IsLoopBack reports whether ip is a loopback address
+		// for instance: 127.0.0.1 (resolve to localhost, IPv4) or ::1 (IPv6)
+		//
+		// IsLinkLocalUnicast reports whether ip is a link-local unicast address
+		//
+		// IsMulticast report whether ip is a multicast address
+		//
+		// IsUnspecified reports unspecified address. IPv4 0.0.0.0 and IPv6 ::
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": "invalid X-Pod-IP format",
+			})
+			return
+		}
+		targetHost.WriteString(ip.String())
+	} else {
+		targetHost.WriteString(strings.Join(internalDNSName, "."))
+	}
+	targetHostStr := net.JoinHostPort(targetHost.String(), strPort)
+	targetURL := &url.URL{
+		Scheme: "http",
+		Host:   targetHostStr,
+	}
+	timeout := time.Duration(getRequestTimeout(c.Request) * float64(time.Second))
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.Out.URL = targetURL
+			pr.Out.Host = targetURL.Host
+			if c.Request.URL.RawQuery != "" {
+				pr.Out.URL.RawQuery = c.Request.URL.RawQuery
+			}
+			pr.SetXForwarded()
+			pr.Out.Header.Set("X-Forwarded-Host", c.Request.Host)
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			var opErr *net.OpError
+			if errors.As(err, &opErr) && opErr.Op == "dial" {
+				log.Error().Str("target", targetHostStr).Err(err).Msg("connection to pod failed")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadGateway)
+				json.NewEncoder(w).Encode(gin.H{
+					"error": "Could not connect to the backend pod",
+				})
+				return
+			}
+			if errors.As(err, &opErr) && opErr.Timeout() {
+				log.Error().Str("target", targetHostStr).Err(err).Msg("request to pod timed out")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusGatewayTimeout)
+				json.NewEncoder(w).Encode(gin.H{
+					"error": "Timed out waiting for the backend pod",
+				})
+				return
+			}
+			log.Error().Str("target", targetHostStr).Err(err).Msg("unexpected proxy error")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(gin.H{
+				"error": "An internal error occurred in the proxy",
+			})
+		},
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: timeout,
+		},
+	}
+	proxy.ServeHTTP(c.Writer, c.Request)
+}
+
+func main() {
+	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).
+		With().
+		Timestamp().
+		Caller().
+		Logger()
+
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(func(c *gin.Context) {
+		start := time.Now()
+		path := c.Request.URL.Path
+		raw := c.Request.URL.RawQuery
+		c.Next()
+		latency := time.Since(start)
+		status := c.Writer.Status()
+		logEvent := logger.Info().
+			Int("status", status).
+			Str("method", c.Request.Method).
+			Str("path", path).
+			Dur("latency", latency).
+			Str("ip", c.ClientIP())
+		if raw != "" {
+			logEvent.Str("query", raw)
+		}
+		if len(c.Errors) > 0 {
+			logEvent.Str("error", c.Errors.String())
+		}
+	})
+
+	r.GET("/healthz", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"status": "OK",
+		})
+	})
+
+	// Catch all requests except routes with higher precedence.
+	r.NoRoute(proxyHandler)
+
+	logger.Info().Int("port", 8888).Msg("starting minrouter")
+
+	r.Run(":8888")
+}
