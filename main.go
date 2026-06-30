@@ -204,11 +204,9 @@ func proxyHandler(c *gin.Context) {
 	timeout := time.Duration(getRequestTimeout(c.Request) * float64(time.Second))
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.Out.URL = targetURL
+			pr.Out.URL.Scheme = targetURL.Scheme
+			pr.Out.URL.Host = targetURL.Host
 			pr.Out.Host = targetURL.Host
-			if c.Request.URL.RawQuery != "" {
-				pr.Out.URL.RawQuery = c.Request.URL.RawQuery
-			}
 			for key, values := range pr.In.Header {
 				for _, v := range values {
 					pr.Out.Header.Add(key, v)
@@ -248,6 +246,14 @@ func proxyHandler(c *gin.Context) {
 			ResponseHeaderTimeout: timeout,
 		},
 	}
+
+	log.Info().
+		Str("host", targetURL.Host).
+		Str("path", c.Request.URL.Path).
+		Str("method", c.Request.Method).
+		Str("pod", podId).
+		Msg("proxying request")
+
 	proxy.ServeHTTP(c.Writer, c.Request)
 }
 
