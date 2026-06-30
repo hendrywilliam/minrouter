@@ -1,0 +1,85 @@
+# Optional
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: minrouter-ns
+---
+# A ClusterIP Service to provide a stable endpoint for the router Pods
+apiVersion: v1
+kind: Service
+metadata:
+  name: minrouter-svc
+  namespace: minrouter-ns # Optional
+spec:
+  type: ClusterIP
+  selector:
+    app: minrouter
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080 # Or simply just 80.
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minrouter-deploy
+spec:
+  replicas: 2 # Run atleast two replicas for High Availability.
+  selector:
+    matchLabels:
+      app: minrouter
+  template:
+    metadata:
+      labels:
+        app: minrouter
+    spec:
+      # Spread Pods across availability zones to improve High Availability.
+      # This reduces the impact of a single node failure on the workload.
+      # This is useful when we have multiple failure-domain: regions, zones, nodes.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: minrouter
+      containers:
+        - name: minrouter
+          image: ${ROUTER_IMAGE}
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+---
+apiVersion: policy/v1
+kind: PodDistruptionBudget
+metadata:
+  name: minrouter-pdb
+  namespace: minrouter-ns
+spec:
+  # Ensure at least one Pod remains available during voluntary disruptions.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: minrouter
