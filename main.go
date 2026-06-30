@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"math"
@@ -9,10 +10,12 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-contrib/logger"
@@ -20,12 +23,15 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// Proxy configuration
 const MIN_TCP_PORT = 1
 const MAX_TCP_PORT = 65535
-
-const DEFAULT_PORT = 8888
-const DEFAULT_NAMESPACE = "default"
 const DEFAULT_PROXY_TIMEOUT = 180.0 // 3 mins
+const DEFAULT_PROXY_PORT = "8080"
+
+// Pod configuration
+const DEFAULT_POD_PORT = "8888"
+const DEFAULT_POD_NAMESPACE = "default"
 const DEFAULT_CLUSTER_DOMAIN = "cluster.local"
 
 var log = zerolog.New(os.Stdout).
@@ -131,9 +137,7 @@ func proxyHandler(c *gin.Context) {
 
 	namespace := c.Request.Header.Get("X-Pod-Namespace")
 	if namespace == "" {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"error": "X-Pod-Namespace is required",
-		})
+		namespace = DEFAULT_POD_NAMESPACE
 	}
 
 	// Sanitize to prevent DNS injection.
@@ -146,10 +150,7 @@ func proxyHandler(c *gin.Context) {
 
 	strPort := c.Request.Header.Get("X-Pod-Port")
 	if strPort == "" {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"error": "X-Pod-Port is required",
-		})
-		return
+		strPort = DEFAULT_POD_PORT
 	}
 	port, err := strconv.Atoi(c.Request.Header.Get("X-Pod-Port"))
 	if err != nil {
@@ -264,7 +265,28 @@ func main() {
 			"status": "OK",
 		})
 	})
-	// Catch all requests except routes with higher precedence.
 	r.NoRoute(proxyHandler)
-	r.Run(":8888")
+
+	srv := &http.Server{
+		Addr:    ":" + DEFAULT_PROXY_PORT,
+		Handler: r,
+	}
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal().Err(err).Msg("failed to start server")
+		}
+	}()
+	log.Info().Str("port", DEFAULT_PROXY_PORT).Msg("server started")
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Info().Msg("shutting down server...")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatal().Err(err).Msg("forced server shutdown")
+	}
+	log.Info().Msg("server exited")
 }
