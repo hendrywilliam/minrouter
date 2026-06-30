@@ -208,6 +208,11 @@ func proxyHandler(c *gin.Context) {
 			if c.Request.URL.RawQuery != "" {
 				pr.Out.URL.RawQuery = c.Request.URL.RawQuery
 			}
+			for key, values := range pr.In.Header {
+				for _, v := range values {
+					pr.Out.Header.Add(key, v)
+				}
+			}
 			pr.SetXForwarded()
 			pr.Out.Header.Set("X-Forwarded-Host", c.Request.Host)
 		},
