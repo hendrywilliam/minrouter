@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"math"
@@ -43,6 +44,8 @@ var log = zerolog.New(os.Stdout).
 var clusterDomain = getClusterDomain()
 var dnsLabelRegex = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
 var proxyTimeout = getProxyTimeout()
+var routerAuthToken = os.Getenv("ROUTER_AUTH_TOKEN")
+var allowAuthenticatedRouter = envVarIsTruthy("ALLOW_AUTHENTICATED_ROUTER")
 
 func getProxyTimeout() float64 {
 	raw := os.Getenv("PROXY_TIMEOUT_SECONDS")
@@ -108,6 +111,30 @@ func envVarIsTruthy(name string) bool {
 	truthyValues := []string{"1", "true", "yes", "y"}
 	rawL := strings.ToLower(raw)
 	return slices.Contains(truthyValues, rawL)
+}
+
+func proxyAuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if allowAuthenticatedRouter {
+			routerToken := c.Request.Header.Get("X-Router-Token")
+			if routerToken == "" {
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+					"error": "X-Router-Token header is required",
+				})
+				return
+			}
+			result := subtle.ConstantTimeCompare([]byte(routerToken), []byte(routerAuthToken))
+			if result == 1 {
+				c.Next()
+				return
+			}
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": "Invalid X-Router-Token value",
+			})
+			return
+		}
+		c.Next()
+	}
 }
 
 func proxyHandler(c *gin.Context) {
@@ -259,6 +286,11 @@ func proxyHandler(c *gin.Context) {
 
 func main() {
 	gin.SetMode(gin.ReleaseMode)
+	if allowAuthenticatedRouter {
+		log.Info().Msg("Authentication enabled. request must include valid X-Router-Token header.")
+	} else {
+		log.Warn().Msg("WARNING: Running in UNAUTHENTICATED mode because allow authenticated router is disabled.")
+	}
 	r := gin.New()
 	r.Use(logger.SetLogger(
 		logger.WithLogger(func(c *gin.Context, l zerolog.Logger) zerolog.Logger {
@@ -271,6 +303,7 @@ func main() {
 			"status": "OK",
 		})
 	})
+	r.Use(proxyAuthMiddleware())
 	r.NoRoute(proxyHandler)
 
 	srv := &http.Server{
